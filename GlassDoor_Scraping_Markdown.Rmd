@@ -1,0 +1,169 @@
+---
+title: "Glassdoor Scraper"
+author: "Chris Keeney"
+date: "8/28/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F)
+library(httr)  
+library(xml2)  
+library(rvest)
+library(tidyverse)
+```
+
+## Project Background
+The goal of this project is to take a look at all the current Data Scientist opportunities througout the United States and see what areas have the best opportunities based on my personal preferences. It will consist of three parts.
+
+1. Scraping Glassdoor job listing details
+2. Adding socioeconomic data and scrubbing data
+3. Analysis of best opportunities
+
+## Preparation
+
+Glassdoor isn't the easiest website to scrape from. I hit multiple roadblocks before arriving at this solution. Whenever tackling web scraping, the first issue is to understand the link structure. If you create a job search, it's a long jumbled mess for the first page. First step, is to click on the second page because that will show the structure of a multiple page search. Below is what the link looks like when we search for "Data Science" in "United States"
+
+`https://www.glassdoor.com/Job/us-data-scientist-jobs-SRCH_IL.0,2_IN1_KO3,17_IP2.htm`
+
+Let's break this down into its key components after the `/Job/` tag. 
+
+`/us-data-scientist-jobs-SRCH` is the search parameters and easy enough.
+
+`-SRCH_IL.0,2_IN1_KO3.17` is the road block. It can't be removed, and I couldn't understand the pattern behind it. It's static for every individual search, but the value changes based on what you type in. Therefore, if we wanted to search something other than "Data Scientist", we would need the updated part of this link. 
+
+`_IP2.htm` is the page number. If we change the link to `_IP4.htm`, it will take us to the 4th page of the search assuming there are at least 4 pages. If not, you'll receive a 404 error. This lead to the first roadblock. For some reason, Glassdoor cuts its job searches off at 30 pages. After the 30th page, you'll get a 404 error no matter what. This limits it to 900 job listings, which isn't a large enough sample space. 
+
+The way I got around this is to manually search Data Science jobs at every state and copy/paste the link excluding the `IP2_htm` into a text file. This way, we can get up to 30 pages per state and increase our sample size. The text file of links can be found [in my Github Repository](https://github.com/chrisjkeeney/Glassdoor) file name `Glassdoor-State-Links.txt`
+
+### Selector Gadget
+ I highly suggest using the [Selector Gadget](https://selectorgadget.com/). This tool saves you from having to parse through CSS to obtain the structure names. If you click on an element, it will highlight all of the elements that contain the same tag. The main element will be green, the similar elements will be yellow, and excluded elements will be red. Once you've narrowed down an element you're interested in, the path given is what we can use to scrape the element. 
+
+### Total Job offers
+Now that we have the main links, the next step is to determine how many total job listings there are for each search. We don't want to run into a 404 error when pulling our desired elements. Glassdoor has an element on the sidebar that shows the total number of jobs for your query. After using Selector Gadget, the element name can be determined:
+
+```{r JobCountPic, echo=FALSE, fig.cap="Gadget Selector Job Count", out.width = '100%'}
+knitr::include_graphics("./Markdown/Figures/JobCount.png")
+```
+
+
+This shows us for the particlular web search, there are 24,987 job listings and the element name to scrape that is `.jobsCount`.  Since these element names change, it's best to create variables out of them. While we're at it, let's add the variables for each element we want to scrape.
+* Job Title
+* Company Name
+* Job Location
+* Company Rating
+* Estimated Salary Range
+* Company Rating
+* Posting Time
+
+Here's where I reached the second roadblock. Not each job listing contains all of those elements. We need to create a way that if the element doesn't exist for that job listing, it creates an `NA` so the rest of our elements align. Also, job listings are always changing, so we need a way to scrape all of the items at once on each page. If a job listing is created or removed during the scraping process, it may cause misalignments in our final data frame. 
+
+Luckily, each job listing has it's own main container. As we can see from the photo below, each job listing is in its own element called `.jl`. 
+
+```{r JobListPic, echo=FALSE, fig.cap="Gadget Selector Job Listing", out.width = '100%'}
+knitr::include_graphics(".Markdown/Figures/JobListing.png")
+```
+
+A solution to the missing element issue is to search the container for the element, and if it doesn't exist, an `NA` will be created. the functions `html_node()` and `html_nodes()` are functions from the `rvest` package that make this simple to do. 
+
+Below are the element names for each element I want to pull.
+
+```{r CSSelements, echo=TRUE}
+CSSjobct <- ".jobsCount"
+CSSjobtitle <- ".jobHeader+ .jobTitle"
+CSScompany <- ".jobEmpolyerName"
+CSScitystate <- "#MainCol .loc"
+CSSrating <- ".compactStars"
+CSSsalary <- ".salaryText"
+CSStime <- ".jobLabel.nowrap"
+CSSsize <- ".infoEntity:nth-child(2)"
+```
+
+
+## Initial Scraping
+
+Inside my `Glassdoor-State-Links.txt`, I have 41 separate links that can be pulled in as a list. I didn't use all 50 states because believe it or not, there's not much Data Science Opportunity in Wyoming. First step is to read in the URLs, convert them to a list, and convert each element to a proper link.
+
+```{r URLPull, echo=TRUE}
+URLstate <- read_tsv("./Markdown/Data/Glassdoor-State-Links.txt", col_names = F)
+URLstate <- as.list(URLstate$X1)
+URLjob <- paste0(URLstate,".htm")
+```
+
+Next, we need to find out how many total job listings there are for each link and determine how many pages there are for each link. To do this, I loop through each link and scrape the previously mentioned `.jobsCount` element. There are 30 job listings per page and we only want to pull a maximum of 30 pages so we don't get a 404 kickback.
+
+```{r Jobcount, echo=TRUE}
+
+totJobs <- lapply(URLjob, function(i){
+  read_html(i) %>%
+    html_nodes(".jobsCount") %>%
+    html_text() %>%
+    gsub("[^0-9]","",.) %>%
+    as.integer()
+})
+
+totPages <- lapply(totJobs,function(i){as.integer(min(ceiling(i/30),30))})
+```
+
+Now that we have the total number of pages for each link, we can compile a list of all links and store it as a list. I usually like to save this list, so I don't have to compile it again at a later time. 
+
+```{r URLCompile, echo=TRUE}
+
+URLall <- lapply(seq_along(URLstate), function(i) paste0(URLstate[[i]], "_IP", seq_len(totPages[[i]]),".htm"))
+URLall <- unlist(URLall)
+
+#saveRDS(URLall,file = "./Data/ALL-GlassDoor-Data-Science-URLS.Rds")
+```
+
+## Let the Scraping Begin!
+
+With all the possible links in hand, we can create a scraping tool to pull in all the elements. It's easier to turn it into a function so it pulls them all in once and keeps a consistent dataframe. The packages `rvest, httr, and xml2` make this very easy.
+
+
+```{r Scraper_Tool, echo=TRUE}
+
+GD_Scraper <-function(x=1:100) {map_df(x, function(i) {
+  cat(" P", i, sep = "")
+  pg <- read_html(GET(URLall[i]))
+  jobTitle <- pg %>% html_nodes(CSSjobtitle) %>% 
+    html_text() %>% data.frame(Job_Title = ., stringsAsFactors = F)
+  
+  company <- pg %>% html_nodes(CSScompany) %>% 
+    html_text() %>% data.frame(Company_Name = ., stringsAsFactors = F)
+  
+  cityState <- pg %>% html_nodes(CSScitystate) %>% 
+    html_text() %>% data.frame(City_State = ., stringsAsFactors = F)
+  
+  rating <- pg %>% html_nodes(".jl") %>% html_node(CSSrating) %>% 
+    html_text() %>% data.frame(Company_Rating = ., stringsAsFactors = F)
+  
+ salary <- pg %>% html_nodes(".jl") %>% html_node(CSSsalary) %>% 
+    html_text() %>% data.frame(salary_Range = ., stringsAsFactors = F)
+ 
+ length <- pg %>% html_nodes(".jl") %>% html_node(CSStime) %>% 
+   html_text() %>% data.frame(Post_Date = ., stringsAsFactors = F)
+ 
+data.raw<- cbind(jobTitle,company,cityState,rating,salary,length)
+})}
+```
+
+This function just pings the website `(read_html)`, pulls the nodes `(html_node & html_nodes)`, extracts the texts `(html_text)` and converts it to a data frame. It only requires the range (defaults to 1:100) of URLs you want to pull. I designed it this way so that if there are a large number of links, they can be pulled in as a batch. That way, if there's an error, the whole process won't have to be ran again.
+
+Lastly, just run the scraper up to the number of URL's you have, `rbind` the results, and export the data frame.
+
+```{r Glassdoor_Scraping, message = FALSE, echo=TRUE}
+
+data.raw1 <- GD_Scraper(1:100)
+data.raw2 <- GD_Scraper(101:200)
+data.raw3 <- GD_Scraper(201:300)
+data.raw4 <- GD_Scraper(301:400)
+data.raw5 <- GD_Scraper(401:500)
+data.raw6 <- GD_Scraper(501:length(URLall))
+
+data.total <- data.raw1 %>% 
+  rbind(data.raw2,data.raw3,data.raw4,data.raw5,data.raw6)
+
+#saveRDS(data.total,"./Data/Data-Raw-Total.RDS")
+```
+
+That's it for the first part! Next, I'll get into cleaning up the raw data and pull in some additional external settings
